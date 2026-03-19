@@ -1,0 +1,222 @@
+# Kafka Streams alert project
+
+Приложение отправляет сообщение в topic `product-alerts`, если суммарная выручка по продукту за последнюю минуту превышает `3000`.
+
+Формула выручки для одной покупки:
+
+`purchase.quantity * product.price`
+
+## Что реализовано
+
+- чтение `products` и `purchases` из Kafka
+- re-key для `products` по `product.id`
+- re-key для `purchases` по `purchase.productid`
+- join покупок с продуктами
+- расчёт выручки по каждой покупке
+- оконная агрегация в минутном окне
+- отправка алерта в `product-alerts` после закрытия окна
+
+## Стек
+
+- Java 17
+- Gradle 7.6+
+- Kafka Streams 2.8.0
+- Confluent Avro Serde 6.2.0
+- Kafka Connect Datagen
+- Schema Registry
+
+## Структура проекта
+
+- `src/main/java/org/example/AlertApplication.java` — основная топология Kafka Streams
+- `src/main/java/org/example/model/*` — модели `ProductRevenue` и `AlertMessage`
+- `src/main/java/org/example/serde/JsonSerde.java` — JSON serde для внутренних моделей и алертов
+- `src/main/resources/connectors/*.json` — конфиги Datagen-коннекторов
+- `src/main/avro/*.avsc` — Avro-схемы для генерации Java-классов
+- `product.avsc`, `purchase.avsc` — исходные схемы для Datagen
+
+## Важные замечания
+
+1. `products` в Datagen приходят с пустым Kafka key, поэтому в приложении сделан re-key по `product.id`.
+2. После `selectKey` для `purchases` добавлен `repartition(...)` с явным `Long` serde, иначе Streams падает на internal topic.
+3. Datagen-коннекторы имеют лимит `iterations=100000`. После исчерпания лимита task завершится — это нормальное поведение.
+4. Если нужно прогнать генерацию заново, проще удалить коннектор и создать его снова или поменять имя коннектора.
+5. Для повторного запуска приложения после неудачных прогонов полезно:
+   - удалить локальный state: `rm -rf /tmp/kafka-streams-alert-state`
+   - при необходимости сменить `application.id`
+
+## Локальный запуск под Windows через WSL
+
+Ниже — рабочий сценарий без Docker Desktop, через Ubuntu в WSL.
+
+### 1. Установить Java и Gradle
+
+В Ubuntu:
+
+```bash
+sudo apt update
+sudo apt install -y openjdk-17-jdk zip unzip curl
+```
+
+Поставить Gradle 7.6+ любым удобным способом.
+
+Проверка:
+
+```bash
+java -version
+gradle -v
+```
+
+### 2. Поднять Kafka, Schema Registry и Kafka Connect
+
+В проекте использовался Confluent Platform 8.1.1 в KRaft-режиме.
+
+#### Форматирование Kafka storage
+
+```bash
+cd ~/kafka/confluent-8.1.1
+bin/kafka-storage random-uuid
+bin/kafka-storage format --standalone -t <UUID> -c etc/kafka/server.properties
+```
+
+#### Запуск Kafka
+
+```bash
+cd ~/kafka/confluent-8.1.1
+bin/kafka-server-start etc/kafka/server.properties
+```
+
+#### Запуск Schema Registry
+
+В новом окне:
+
+```bash
+cd ~/kafka/confluent-8.1.1
+bin/schema-registry-start etc/schema-registry/schema-registry.properties
+```
+
+#### Запуск Kafka Connect
+
+В новом окне:
+
+```bash
+cd ~/kafka/confluent-8.1.1
+bin/connect-distributed etc/kafka/connect-distributed.properties
+```
+
+### 3. Установить Datagen plugin
+
+```bash
+cd ~/kafka/confluent-8.1.1
+bin/confluent-hub install confluentinc/kafka-connect-datagen:latest
+```
+
+После установки обязательно перезапустить Kafka Connect.
+
+### 4. Создать топики
+
+```bash
+cd ~/kafka/confluent-8.1.1
+bin/kafka-topics --create --topic products --bootstrap-server localhost:9092 --partitions 1 --replication-factor 1
+bin/kafka-topics --create --topic purchases --bootstrap-server localhost:9092 --partitions 1 --replication-factor 1
+bin/kafka-topics --create --topic product-alerts --bootstrap-server localhost:9092 --partitions 1 --replication-factor 1
+```
+
+### 5. Зарегистрировать Datagen-коннекторы
+
+Из Ubuntu:
+
+```bash
+curl -X POST http://localhost:8083/connectors \
+  -H "Content-Type: application/json" \
+  --data @/mnt/c/Users/Egor/kafka-streams-alert-project/kafka-streams-alert-project/src/main/resources/connectors/products-datagen.json
+```
+
+```bash
+curl -X POST http://localhost:8083/connectors \
+  -H "Content-Type: application/json" \
+  --data @/mnt/c/Users/Egor/kafka-streams-alert-project/kafka-streams-alert-project/src/main/resources/connectors/purchases-datagen.json
+```
+
+Проверка:
+
+```bash
+curl http://localhost:8083/connectors/products-datagen/status
+curl http://localhost:8083/connectors/purchases-datagen/status
+```
+
+### 6. Запустить приложение
+
+```bash
+cd ~/kafka-project
+gradle clean run
+```
+
+Если запускается из Windows-пути, можно использовать копию проекта в Linux-папке `~/kafka-project`.
+
+### 7. Проверить алерты
+
+```bash
+cd ~/kafka/confluent-8.1.1
+bin/kafka-console-consumer --bootstrap-server localhost:9092 --topic product-alerts --from-beginning
+```
+
+### 8. Проверить, что входные данные пишутся
+
+Для проверки количества сообщений:
+
+```bash
+cd ~/kafka/confluent-8.1.1
+bin/kafka-get-offsets --bootstrap-server localhost:9092 --topic products
+bin/kafka-get-offsets --bootstrap-server localhost:9092 --topic purchases
+```
+
+## Быстрый запуск через Docker
+
+Если Docker работает, можно использовать `docker-compose.yml`.
+
+```bash
+docker compose up -d
+```
+
+После этого зарегистрировать коннекторы и запустить приложение так же, как выше.
+
+## Что сдавать
+
+В проекте уже есть:
+
+- исправленный `build.gradle`
+- рабочая топология Kafka Streams
+- модели и serde
+- Avro-схемы в `src/main/avro`
+- конфиги Datagen-коннекторов под локальный запуск через WSL
+- пошаговая инструкция в README
+
+## Известные особенности
+
+- В логах возможны предупреждения вида `schema.registry.url isn't a known config` для consumer/admin/producer — это не мешает работе Streams.
+- При первом старте internal topics типа `...repartition` могут несколько секунд логироваться как `UNKNOWN_TOPIC_OR_PARTITION`, пока Kafka Streams не создаст их автоматически.
+- Если consumer по `product-alerts` ничего не показывает, это значит либо окно ещё не закрылось, либо новых покупок уже не приходит.
+
+## Полезные команды
+
+Удалить локальный state:
+
+```bash
+rm -rf /tmp/kafka-streams-alert-state
+```
+
+Удалить коннекторы:
+
+```bash
+curl -X DELETE http://localhost:8083/connectors/products-datagen
+curl -X DELETE http://localhost:8083/connectors/purchases-datagen
+```
+
+Проверить offsets:
+
+```bash
+cd ~/kafka/confluent-8.1.1
+bin/kafka-get-offsets --bootstrap-server localhost:9092 --topic products
+bin/kafka-get-offsets --bootstrap-server localhost:9092 --topic purchases
+bin/kafka-get-offsets --bootstrap-server localhost:9092 --topic product-alerts
+```
